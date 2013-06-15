@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -15,10 +16,11 @@ import (
 const VERSION = "0.2.4"
 
 var (
-	myId            string
-	cache           *Cache
-	dryRun          = false
-	runningCheckers = 0
+	myId              string
+	cache             *Cache
+	dryRun            = false
+	runningCheckers   = 0
+	statusCheckInterval = 60
 )
 
 func addCheck(line string) {
@@ -86,8 +88,8 @@ func printStats(cache *Cache) {
 		}
 		time.Sleep(time.Duration(step) * time.Second)
 		count += step
-		if count >= 60 {
-			// Every minute
+		if count >= statusCheckInterval {
+			// statusCheckInterval seconds
 			count = 0
 			msg := "backend URLs are being tested"
 			if dryRun == true {
@@ -129,6 +131,43 @@ func handleSignals() {
 	}()
 }
 
+/*
+ * Actively Look for backends
+ * XXX: there are most likely race conditions... but is should be ok
+ *      with a single server set up.
+ */
+func findBackends(cache *Cache) {
+	for {
+		log.Println("Looking for backends")
+		frontends,err := cache.redisConn.Keys("frontend:*").List()
+		if err != nil {
+			log.Println(err.Error())
+			os.Exit(1)
+		}
+		for _,frontend := range frontends {
+			log.Println("Found Frontend:", frontend)
+			backends,err := cache.redisConn.Lrange(frontend, 0, -1).List()
+			frontend_id := strings.Join(strings.Split(strings.TrimSpace(frontend), ":")[1:],":")
+			if err != nil {
+				log.Println(err.Error())
+				os.Exit(1)
+			}
+			for idx,backend := range backends {
+				log.Println("Found backend:", idx-1, backend)
+				if ( idx != 0 ) {
+					check := fmt.Sprintf("%s;%s;%d;%d",frontend_id,backend,idx-1,len(backends)-1);
+
+					// Probably want to find a better way to do
+					// this but it seems ok for now
+					addCheck(check)
+				}
+			}
+		}
+		log.Println("Done looking for backends")
+		time.Sleep(time.Duration(10) * time.Second)
+	}
+}
+
 func parseFlags(cpuProfile *bool) {
 	parseDuration := func(v *time.Duration, n string, def int, help string) {
 		i := flag.Int(n, def, help)
@@ -146,6 +185,8 @@ func parseFlags(cpuProfile *bool) {
 		"TCP connection timeout (seconds)")
 	parseDuration(&ioTimeout, "io", IO_TIMEOUT,
 		"Socket read/write timeout (seconds)")
+    flag.IntVar(&statusCheckInterval, "status", 60,
+        "Interval of reporting status (seconds)")
 	flag.StringVar(&redisAddress, "redis", REDIS_ADDRESS,
 		"Network address of Redis")
 	flag.BoolVar(cpuProfile, "cpuprofile", false,
@@ -193,6 +234,11 @@ func main() {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
-	// This function will block and print the stats every minute
+
+	// This function will check redis for all frontends and add checks for each backend
+	go findBackends(cache)
+
+	// This function will block and print the stats every statusCheckInterval
+	// seconds
 	printStats(cache)
 }
